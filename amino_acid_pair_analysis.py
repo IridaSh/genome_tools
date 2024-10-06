@@ -1,100 +1,230 @@
 import os
+import glob
 import gzip
-from Bio.PDB import PDBParser, is_aa
-from Bio.Data.IUPACData import protein_letters_3to1
+import random
 import numpy as np
+from Bio.PDB import PDBParser
 from collections import defaultdict
+import logging
 
-def process_pdb_file(pdb_file_path):
+# ==============================
+# Configuration and Setup
+# ==============================
+
+# Configure logging to display INFO and higher level messages
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
+# Mapping from three-letter to one-letter amino acid codes
+THREE_TO_ONE = {
+    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E',
+    'PHE': 'F', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
+    'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N',
+    'PRO': 'P', 'GLN': 'Q', 'ARG': 'R', 'SER': 'S',
+    'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y',
+    # Add non-standard amino acids if necessary
+}
+
+# ==============================
+# Function Definitions
+# ==============================
+
+def extract_sequence_and_coords(pdb_file):
+    """
+    Extracts the amino acid sequence and average coordinates from a PDB file.
+
+    Args:
+        pdb_file (str): Path to the gzipped PDB file.
+
+    Returns:
+        tuple: (sequence list, coordinates list)
+    """
     parser = PDBParser(QUIET=True)
-    if pdb_file_path.endswith('.gz'):
-        with gzip.open(pdb_file_path, 'rt') as handle:
-            structure = parser.get_structure('X', handle)
-    else:
-        structure = parser.get_structure('X', pdb_file_path)
-    residues = []
-    residue_index = 0
+    sequence = []
+    coordinates = []
+
+    try:
+        with gzip.open(pdb_file, 'rt') as file:
+            structure = parser.get_structure('protein', file)
+    except Exception as e:
+        logging.error(f"Failed to parse {pdb_file}: {e}")
+        return sequence, coordinates
+
     for model in structure:
         for chain in model:
             for residue in chain:
-                if is_aa(residue, standard=True):
-                    atoms = list(residue.get_atoms())
-                    coords = np.array([atom.get_coord() for atom in atoms])
-                    avg_coord = np.mean(coords, axis=0)
-                    residue_number = residue.get_id()[1]
-                    residue_name = residue.get_resname()
-                    try:
-                        residue_letter = protein_letters_3to1[residue_name.upper()]
-                    except KeyError:
-                        continue  # Skip non-standard amino acids
-                    residues.append((residue_index, residue_number, residue_letter, avg_coord))
-                    residue_index += 1
-    return residues
+                # Filter out hetero residues (HETATM) and water molecules
+                if residue.get_id()[0] != ' ':
+                    continue
 
-def process_residues(residues):
-    near_pairs = defaultdict(int)
-    total_pairs = defaultdict(int)
-    n = len(residues)
-    for i in range(n):
-        res_i = residues[i]
-        for j in range(i+100, n):  # Residues at least 100 apart in sequence
-            res_j = residues[j]
-            dist = np.linalg.norm(res_i[3] - res_j[3])
-            pair = (res_i[2], res_j[2])  # (residue_letter_i, residue_letter_j)
-            total_pairs[pair] += 1
-            if dist < 10.0:
-                near_pairs[pair] += 1
-    return near_pairs, total_pairs
+                amino_acid = residue.get_resname()
+                one_letter = THREE_TO_ONE.get(amino_acid, 'X')  # 'X' for unknown
+                if one_letter == 'X':
+                    logging.warning(f"Unknown amino acid '{amino_acid}' in {pdb_file}, residue {residue.get_id()}")
+                sequence.append(one_letter)
 
-def main():
-    pdb_dir = "YEAST_PDBs"  # TODO replace this with the directory
-    pdb_files = [f for f in os.listdir(pdb_dir) if f.endswith(".pdb.gz") or f.endswith(".pdb")]
+                # Extract atom coordinates
+                atom_coords = [atom.get_coord() for atom in residue if atom.get_coord().size == 3]
+                if atom_coords:
+                    avg_coords = np.mean(atom_coords, axis=0)
+                    coordinates.append(avg_coords)
+                else:
+                    # Assign NaN if no coordinates are present
+                    coordinates.append(np.array([np.nan, np.nan, np.nan]))
 
-    total_near_pairs = defaultdict(int)
-    total_pairs = defaultdict(int)
-    aa_counts = defaultdict(int)
+    logging.info(f"Extracted {len(sequence)} residues from {pdb_file}")
+    return sequence, coordinates
 
-    for pdb_file in pdb_files:
-        pdb_file_path = os.path.join(pdb_dir, pdb_file)
-        print(f"Processing {pdb_file}...")
-        residues = process_pdb_file(pdb_file_path)
-        for res in residues:
-            aa_counts[res[2]] += 1  # res[2] is residue_letter
-        near_pairs, pairs = process_residues(residues)
-        for pair, count in near_pairs.items():
-            total_near_pairs[pair] += count
-        for pair, count in pairs.items():
-            total_pairs[pair] += count
+def randomize_sequence(sequence):
+    """
+    Returns a shuffled copy of the input sequence.
 
-    # Compute amino acid frequencies
-    total_aa_count = sum(aa_counts.values())
-    aa_freqs = {aa: count / total_aa_count for aa, count in aa_counts.items()}
+    Args:
+        sequence (list): Original amino acid sequence.
 
-    # Compute expected counts
-    total_pairs_count = sum(total_pairs.values())
-    expected_pairs = {}
-    for aa1 in aa_freqs:
-        for aa2 in aa_freqs:
-            expected_count = total_pairs_count * aa_freqs[aa1] * aa_freqs[aa2]
-            expected_pairs[(aa1, aa2)] = expected_count
+    Returns:
+        list: Shuffled amino acid sequence.
+    """
+    random_sequence = sequence.copy()
+    random.shuffle(random_sequence)
+    return random_sequence
 
-    # Write results to a CSV file
-    import csv
-    with open('amino_acid_pair_counts.csv', 'w', newline='') as csvfile:
-        fieldnames = ['AminoAcid1', 'AminoAcid2', 'ObservedCount', 'ExpectedCount', 'Obs_Exp_Ratio']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        for pair in expected_pairs:
-            observed = total_near_pairs.get(pair, 0)
-            expected = expected_pairs[pair]
-            ratio = observed / expected if expected > 0 else 0
-            writer.writerow({'AminoAcid1': pair[0],
-                             'AminoAcid2': pair[1],
-                             'ObservedCount': observed,
-                             'ExpectedCount': expected,
-                             'Obs_Exp_Ratio': ratio})
+def calculate_proximity(sequence, coordinates, sequence_gap=100, distance_threshold=10):
+    """
+    Calculates the frequency of amino acid pairs that are at least `sequence_gap` residues apart
+    and within `distance_threshold` Angstroms in 3D space.
 
-    print("Analysis complete. Results saved to 'amino_acid_pair_counts.csv'.")
+    Args:
+        sequence (list): Amino acid sequence.
+        coordinates (list): List of average coordinates per residue.
+        sequence_gap (int): Minimum number of residues separating the pair.
+        distance_threshold (float): Maximum distance in Angstroms to consider proximity.
+
+    Returns:
+        defaultdict: Counts of amino acid pairs.
+    """
+    pairs = defaultdict(int)
+    total_length = len(sequence)
+
+    for i in range(total_length):
+        j_start = i + sequence_gap
+        if j_start >= total_length:
+            continue
+
+        for j in range(j_start, total_length):
+            # Skip if either residue lacks valid coordinates
+            if np.isnan(coordinates[i]).any() or np.isnan(coordinates[j]).any():
+                continue
+
+            # Calculate Euclidean distance
+            dist = np.linalg.norm(coordinates[i] - coordinates[j])
+            if dist <= distance_threshold:
+                aa1 = sequence[i]
+                aa2 = sequence[j]
+                pair = tuple(sorted((aa1, aa2)))  # Sort to handle unordered pairs (A,B) == (B,A)
+                pairs[pair] += 1
+
+        # Optional: Log progress every 10,000 residues
+        if (i + 1) % 10000 == 0:
+            logging.info(f"Processed {i + 1}/{total_length} residues for proximity")
+
+    return pairs
+
+def analyze_multiple_pdbs(pdb_dir, output_file, randomizations=100, sequence_gap=100, distance_threshold=10):
+    """
+    Analyzes multiple PDB files to find amino acid pairs that are proximal in 3D space
+    but separated by a significant sequence gap, comparing against randomized sequences.
+
+    Args:
+        pdb_dir (str): Directory containing gzipped PDB files.
+        output_file (str): Path to the output results file.
+        randomizations (int): Number of random sequence shuffles per PDB.
+        sequence_gap (int): Minimum number of residues separating the pair.
+        distance_threshold (float): Maximum distance in Angstroms to consider proximity.
+    """
+    pdb_files = glob.glob(os.path.join(pdb_dir, '*.pdb.gz'))
+    logging.info(f"Found {len(pdb_files)} PDB files in '{pdb_dir}'")
+
+    if not pdb_files:
+        logging.error("No PDB files found. Please check the directory path and file extensions.")
+        return
+
+    all_observed_pairs = defaultdict(int)
+    random_pair_counts = defaultdict(list)
+
+    for idx, pdb_file in enumerate(pdb_files, 1):
+        pdb_basename = os.path.basename(pdb_file)
+        logging.info(f"Processing file {idx}/{len(pdb_files)}: {pdb_basename}")
+
+        sequence, coordinates = extract_sequence_and_coords(pdb_file)
+
+        if not sequence:
+            logging.warning(f"No sequence extracted from {pdb_basename}. Skipping.")
+            continue
+
+        if len(sequence) != len(coordinates):
+            logging.warning(f"Sequence and coordinates length mismatch in {pdb_basename}. Skipping.")
+            continue
+
+        # Calculate observed pairs
+        observed_pairs = calculate_proximity(sequence, coordinates, sequence_gap, distance_threshold)
+        for pair, count in observed_pairs.items():
+            all_observed_pairs[pair] += count
+
+        # Perform randomizations
+        for rand in range(1, randomizations + 1):
+            random_sequence = randomize_sequence(sequence)
+            random_pairs = calculate_proximity(random_sequence, coordinates, sequence_gap, distance_threshold)
+            for pair, count in random_pairs.items():
+                random_pair_counts[pair].append(count)
+
+            # Optional: Log progress every 10 randomizations
+            if rand % 10 == 0:
+                logging.debug(f"Completed {rand}/{randomizations} randomizations for {pdb_basename}")
+
+    # Write results to the output file
+    try:
+        with open(output_file, 'w') as f:
+            header = "AA1\tAA2\tObs_Count\tMean_Random_Count\tStdDev_Random_Count\tZ-Score\n"
+            f.write(header)
+            for pair, observed_count in all_observed_pairs.items():
+                random_counts = random_pair_counts.get(pair, [0] * randomizations)
+                mean_random_count = np.mean(random_counts)
+                std_random_count = np.std(random_counts)
+
+                if std_random_count == 0:
+                    z_score = 'NA'
+                else:
+                    z_score = (observed_count - mean_random_count) / std_random_count
+
+                line = f"{pair[0]}\t{pair[1]}\t{observed_count}\t{mean_random_count:.2f}\t{std_random_count:.2f}\t{z_score}\n"
+                f.write(line)
+        logging.info(f"Analysis complete. Results saved to '{output_file}'")
+    except Exception as e:
+        logging.error(f"Failed to write results to '{output_file}': {e}")
+
+# ==============================
+# Main Execution
+# ==============================
 
 if __name__ == "__main__":
-    main()
+    # Update the pdb_dir to your actual data directory
+    pdb_dir = "/Users/iridashyti/Documents/Duke/Fall2024/Genome tools and technologies/hw/test"
+    output_file = "amino_acid_pair_analysis_v2.txt"
+
+    # Optional: Validate input directory
+    if not os.path.isdir(pdb_dir):
+        logging.error(f"The specified PDB directory '{pdb_dir}' does not exist.")
+    else:
+        analyze_multiple_pdbs(
+            pdb_dir=pdb_dir,
+            output_file=output_file,
+            randomizations=100,        # You can reduce this number for quicker testing
+            sequence_gap=100,
+            distance_threshold=10
+        )
