@@ -7,11 +7,7 @@ from Bio.PDB import PDBParser
 from collections import defaultdict
 import logging
 
-# ==============================
-# Configuration and Setup
-# ==============================
 
-# Configure logging to display INFO and higher level messages
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -30,9 +26,6 @@ THREE_TO_ONE = {
     # Add non-standard amino acids if necessary
 }
 
-# ==============================
-# Function Definitions
-# ==============================
 
 def extract_sequence_and_coords(pdb_file):
     """
@@ -208,9 +201,6 @@ def analyze_multiple_pdbs(pdb_dir, output_file, randomizations=100, sequence_gap
     except Exception as e:
         logging.error(f"Failed to write results to '{output_file}': {e}")
 
-# ==============================
-# Main Execution
-# ==============================
 
 if __name__ == "__main__":
     # Update the pdb_dir to your actual data directory
