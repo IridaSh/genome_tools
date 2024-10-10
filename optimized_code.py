@@ -6,6 +6,8 @@ import numpy as np
 from Bio.PDB import PDBParser
 from collections import defaultdict
 import logging
+from scipy.spatial import cKDTree
+import multiprocessing as mp
 
 
 logging.basicConfig(
@@ -104,29 +106,67 @@ def calculate_proximity(sequence, coordinates, sequence_gap=100, distance_thresh
     pairs = defaultdict(int)
     total_length = len(sequence)
 
-    for i in range(total_length):
-        j_start = i + sequence_gap
-        if j_start >= total_length:
-            continue
+    # Convert coordinates to numpy array
+    coords_array = np.array(coordinates)
 
-        for j in range(j_start, total_length):
-            # Skip if either residue lacks valid coordinates
-            if np.isnan(coordinates[i]).any() or np.isnan(coordinates[j]).any():
-                continue
+    # Filter out residues with NaN coordinates
+    valid_indices = ~np.isnan(coords_array).any(axis=1)
+    valid_coords = coords_array[valid_indices]
+    valid_sequence = np.array(sequence)[valid_indices]
+    valid_residue_indices = np.arange(total_length)[valid_indices]
 
-            # Calculate Euclidean distance
-            dist = np.linalg.norm(coordinates[i] - coordinates[j])
-            if dist <= distance_threshold:
-                aa1 = sequence[i]
-                aa2 = sequence[j]
-                pair = tuple(sorted((aa1, aa2)))  # Sort to handle unordered pairs (A,B) == (B,A)
-                pairs[pair] += 1
+    if len(valid_coords) == 0:
+        return pairs
 
-        # Optional: Log progress every 10,000 residues
-        if (i + 1) % 10000 == 0:
-            logging.info(f"Processed {i + 1}/{total_length} residues for proximity")
+    # Build KD-tree
+    tree = cKDTree(valid_coords)
+
+    # Query for all pairs within distance threshold
+    pairs_indices = tree.query_pairs(distance_threshold)
+
+    for idx1, idx2 in pairs_indices:
+        seq_idx1 = valid_residue_indices[idx1]
+        seq_idx2 = valid_residue_indices[idx2]
+
+        # Check sequence gap
+        if abs(seq_idx1 - seq_idx2) >= sequence_gap:
+            aa1 = valid_sequence[idx1]
+            aa2 = valid_sequence[idx2]
+            pair = tuple(sorted((aa1, aa2)))
+            pairs[pair] += 1
 
     return pairs
+
+def process_pdb_file(args):
+    """
+    Processes a single PDB file, performing randomizations.
+
+    Args:
+        args (tuple): Contains pdb_file, randomizations, sequence_gap, distance_threshold.
+
+    Returns:
+        tuple: (observed_pairs, random_pair_counts)
+    """
+    pdb_file, randomizations, sequence_gap, distance_threshold = args
+    sequence, coordinates = extract_sequence_and_coords(pdb_file)
+    observed_pairs = defaultdict(int)
+    random_pair_counts = [defaultdict(int) for _ in range(randomizations)]
+
+    if not sequence or len(sequence) != len(coordinates):
+        logging.warning(f"Issue with sequence and coordinates in {pdb_file}. Skipping.")
+        return observed_pairs, random_pair_counts
+
+    # Calculate observed pairs
+    observed_pairs = calculate_proximity(sequence, coordinates, sequence_gap, distance_threshold)
+
+    # Perform randomizations
+    for rand in range(randomizations):
+        random_sequence = randomize_sequence(sequence)
+        random_pairs = calculate_proximity(random_sequence, coordinates, sequence_gap, distance_threshold)
+        for pair, count in random_pairs.items():
+            random_pair_counts[rand][pair] += count
+
+    return observed_pairs, random_pair_counts
 
 def analyze_multiple_pdbs(pdb_dir, output_file, randomizations=100, sequence_gap=100, distance_threshold=10):
     """
@@ -147,45 +187,34 @@ def analyze_multiple_pdbs(pdb_dir, output_file, randomizations=100, sequence_gap
         logging.error("No PDB files found. Please check the directory path and file extensions.")
         return
 
+    # Prepare arguments for multiprocessing
+    args_list = [(pdb_file, randomizations, sequence_gap, distance_threshold) for pdb_file in pdb_files]
+
+    # Initialize the overall counts
     all_observed_pairs = defaultdict(int)
-    # Initialize a list to hold counts per randomization across all files
-    random_pair_sums_per_randomization = [defaultdict(int) for _ in range(randomizations)]
+    random_pair_counts = [defaultdict(int) for _ in range(randomizations)]
 
-    for idx, pdb_file in enumerate(pdb_files, 1):
-        pdb_basename = os.path.basename(pdb_file)
-        logging.info(f"Processing file {idx}/{len(pdb_files)}: {pdb_basename}")
+    # Use multiprocessing to process PDB files in parallel
+    with mp.Pool(mp.cpu_count()) as pool:
+        results = pool.map(process_pdb_file, args_list)
 
-        sequence, coordinates = extract_sequence_and_coords(pdb_file)
-
-        if not sequence:
-            logging.warning(f"No sequence extracted from {pdb_basename}. Skipping.")
-            continue
-
-        if len(sequence) != len(coordinates):
-            logging.warning(f"Sequence and coordinates length mismatch in {pdb_basename}. Skipping.")
-            continue
-
-        # Calculate observed pairs
-        observed_pairs = calculate_proximity(sequence, coordinates, sequence_gap, distance_threshold)
+    # Aggregate results
+    for observed_pairs, rand_counts_list in results:
+        # Aggregate observed pairs
         for pair, count in observed_pairs.items():
             all_observed_pairs[pair] += count
 
-        # Perform randomizations
-        for rand in range(randomizations):
-            random_sequence = randomize_sequence(sequence)
-            random_pairs = calculate_proximity(random_sequence, coordinates, sequence_gap, distance_threshold)
-            for pair, count in random_pairs.items():
-                random_pair_sums_per_randomization[rand][pair] += count
+        # Aggregate random pairs
+        for i in range(randomizations):
+            rand_counts = rand_counts_list[i]
+            for pair, count in rand_counts.items():
+                random_pair_counts[i][pair] += count
 
-            # Optional: Log progress every 10 randomizations
-            if (rand + 1) % 10 == 0:
-                logging.debug(f"Completed {rand + 1}/{randomizations} randomizations for {pdb_basename}")
-
-    # Prepare random counts per pair across all randomizations
-    random_pair_totals = defaultdict(list)
-    for rand_dict in random_pair_sums_per_randomization:
+    # Collect counts per pair across randomizations
+    pair_random_counts = defaultdict(list)
+    for rand_dict in random_pair_counts:
         for pair, count in rand_dict.items():
-            random_pair_totals[pair].append(count)
+            pair_random_counts[pair].append(count)
 
     # Write results to the output file
     try:
@@ -193,7 +222,7 @@ def analyze_multiple_pdbs(pdb_dir, output_file, randomizations=100, sequence_gap
             header = "AA1\tAA2\tObs_Count\tMean_Random_Count\tStdDev_Random_Count\tZ-Score\n"
             f.write(header)
             for pair, observed_count in all_observed_pairs.items():
-                random_counts = random_pair_totals.get(pair, [0] * randomizations)
+                random_counts = pair_random_counts.get(pair, [0]*randomizations)
                 mean_random_count = np.mean(random_counts)
                 std_random_count = np.std(random_counts)
 
@@ -221,7 +250,7 @@ if __name__ == "__main__":
         analyze_multiple_pdbs(
             pdb_dir=pdb_dir,
             output_file=output_file,
-            randomizations=100,        # You can reduce this number for quicker testing
+            randomizations=100,        # Adjust this number based on your system's capabilities
             sequence_gap=100,
             distance_threshold=10
         )
